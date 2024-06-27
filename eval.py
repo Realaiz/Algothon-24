@@ -2,7 +2,7 @@
 
 import numpy as np
 import pandas as pd
-from teamName import getMyPosition as getPosition
+from FantaLite import getMyPosition as getPosition
 
 nInst = 0
 nt = 0
@@ -28,6 +28,7 @@ def calcPL(prcHist):
     totDVolume = 0
     totDVolumeSignal = 0
     totDVolumeRandom = 0
+    
     value = 0
     todayPLL = []
     (_, nt) = prcHist.shape
