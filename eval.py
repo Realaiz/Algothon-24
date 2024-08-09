@@ -1,9 +1,8 @@
 import numpy as np
 import pandas as pd
-from tree import getMyPosition as getPosition
-import matplotlib.pyplot as plt
+from simplebooster import getMyPosition as getPosition
 
-np.random.seed(42)
+
 nInst = 0
 nt = 0
 commRate = 0.0010

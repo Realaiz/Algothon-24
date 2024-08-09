@@ -1,136 +1,87 @@
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import train_test_split
 import numpy as np
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.stattools import adfuller
-import warnings
 import pandas as pd
 
-warnings.filterwarnings("ignore")
-
-nInst = 50  # Number of instruments (stocks)
-currentPos = np.zeros(nInst)  # Initialise current positions with zeros
-cached_models = [None] * nInst  # Initialise cache for ARIMA models
-cached_predictions = [None] * nInst  # Initialize cache for predictions
-last_eval_day = [
-    -30
-] * nInst  # Initialize the last evaluation day to ensure models are built on the first call
-alpha = 0.07  # Smoothing factor for EMA, between 0 and 1
-smoothed_predictions = np.zeros(nInst)  # Initialise smoothed predictions
-volatility_threshold = 0.04  # Threshold for volatility-based position sizing
+nInst = 50
+currentPos = np.zeros(nInst)
 
 
-# Function to determine the best transformation and fit an ARIMA model
-def fit_arima(stock_series):
-    # Test original series
-    pval_original = adfuller(stock_series)[1]
-    if pval_original < 0.05:
-        best_series = stock_series
-    else:
-        # Test differenced series
-        diff_series = np.diff(stock_series)
-        pval_diff = adfuller(diff_series)[1]
-
-        # Test log-differenced series
-        log_mask = stock_series > 0
-        log_series = np.log(stock_series[log_mask])
-        log_diff_series = np.diff(log_series)
-        pval_log_diff = adfuller(log_diff_series)[1]
-
-        # Choose the best transformation
-        pvals = [pval_original, pval_diff, pval_log_diff]
-        transformations = [stock_series, diff_series, log_diff_series]
-        best_series = transformations[np.argmin(pvals)]
-
-    # Fit ARIMA model on the best transformed series and get the forecast in one step
-    model = ARIMA(best_series, order=(2, 1, 3))
-    forecast = model.fit().forecast(steps=1)[0]
-    return model, forecast
+# Function to prepare data for training
+def prepareData(prcAll, window_size=10):
+    X, y = [], []
+    for i in range(window_size, prcAll.shape[1]):
+        X.append(prcAll[:, i - window_size : i].flatten())
+        y.append(np.log(prcAll[:, i] / prcAll[:, i - 1]))
+    return np.array(X), np.array(y)
 
 
-def momentum_alphas(prcSoFar):
-    data = pd.DataFrame()
-    lags = [30, 60, 90, 180, 270, 360]
-    for lag in lags:
-        data[f"return_{lag//30}m"] = (
-            prcSoFar.pct_change(lag)
-            .stack()
-            .pipe(lambda x: x.clip(lower=x.quantile(0.01), upper=x.quantile(0.99)))
-            .add(1)
-            .pow(1 / (lag / 30))
-            .sub(1)
-        )
-    data = data.swaplevel().dropna()  ##returns
-
-    for lag in [60, 90, 180, 270, 360]:  ##momentum diff indicators
-        data[f"momentum_{lag//30}"] = data[f"return_{lag//30}m"].sub(data.return_1m)
-    data[f"momentum_3_12"] = data[f"return_12m"].sub(data.return_3m)
-
-    for t in range(1, 7):  ##lagged returns
-        data[f"return_1m_t-{t}"] = data.groupby(level=0).return_1m.shift(t)
-    data.info()
-
-    for t in [30, 60, 90, 180, 360]:  ##target returns
-        data[f"target_{t//30}m"] = data.groupby(level=0)[f"return_{t//30}m"].shift(-t)
-
-    return data
+# Function to check if a stock is fluctuating too much within a given window
+def isFluctuating(prices, window=10, threshold=0.01):
+    recent_returns = np.log(prices[-window:] / prices[-window - 1 : -1])
+    if np.std(recent_returns) > threshold:
+        return True
+    return False
 
 
-# Function to process each stock and predict its next price
-def model_series(i, prcSoFar, t):
-    stock_prices = prcSoFar[i]  # Get the prices of the i-th stock
-
-    if (
-        cached_models[i] is None or t - last_eval_day[i] >= 69
-    ):  # Only re-evaluate models every 126 days
-        model, forecast = fit_arima(stock_prices) # Fit the best ARIMA model and get the predicted price
-        cached_models[i] = model  # Cache the model
-        cached_predictions[i] = forecast  # Cache the forecast
-        last_eval_day[i] = t  # Update the last evaluation day
+# Function to check if a stock has had an overall loss in the past window days
+def hasOverallLoss(prices, window=10):
+    profit_loss = prices[-1] / prices[-window]
+    if profit_loss < 1:
+        return True
+    return False
 
 
-    # Apply EMA to the predictions
-    smoothed_predictions[i] = (
-        alpha * cached_predictions[i] + (1 - alpha) * smoothed_predictions[i]
-    )
-    return smoothed_predictions[i]  # Return the smoothed prediction
-
-
-# Main function to get the current position based on price predictions
+# Function to get the trading position using the trained decision tree model
 def getMyPosition(prcSoFar):
-    global currentPos  # Use the global current positions
-    nInst, nt = prcSoFar.shape  # Get the number of instruments and time periods
-    prcSoFar = prcSoFar[:, :-504]
-    if nt < 2:
-        return np.zeros(nInst)  # If not enough data points, return zero positions
+    global currentPos
+    (nins, nt) = prcSoFar.shape
 
-    predictedPrices = [
-        model_series(i, prcSoFar, nt) for i in range(nInst)
-    ]  # Get the predicted prices for each stock
-    
-    predictedPrices = np.array(
-        predictedPrices
-    )  # Convert list of predicted prices to a numpy array
-    latest_price = prcSoFar[:, -1]  # Get the latest prices of all stocks
-    priceChanges = predictedPrices - latest_price  # Calculate the price changes
+    np.random.seed(42)
 
-    position_limit = 10000  # Maximum absolute value of position per stock
+    # Prepare data
+    X, y = prepareData(prcSoFar)
 
-    # Calculate the positions based on price change signal
-    rpos = np.zeros(nInst)
-    for i in range(nInst):
-        volatility = np.std(prcSoFar[i, -30:]) / np.mean(
-            prcSoFar[i, -30:]
-        )  # 30-day historical volatility
+    # Split data into training and validation sets
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, shuffle=False
+    )
 
-        if priceChanges[i] > 0 and volatility < volatility_threshold:
-            rpos[i] = position_limit / latest_price[i]  # 100% long position
-        elif priceChanges[i] > 0 and volatility > volatility_threshold:
-            rpos[i] = (position_limit / latest_price[i]) * 0.75  # 75% long position
-        elif priceChanges[i] < 0 and volatility < volatility_threshold:
-            rpos[i] = -position_limit / latest_price[i]  # 100% short position
-        elif priceChanges[i] < 0 and volatility > volatility_threshold:
-            rpos[i] = -(position_limit / latest_price[i]) * 0.75 # 75% short position
+    # Hyperparameter tuning for the decision tree
+    param_grid = {
+        "max_depth": [5, 7],
+        "min_samples_split": [2, 5, 10],
+        "min_samples_leaf": [2, 5, 7],
+    }
 
-    # Update the current positions
-    currentPos = np.array([int(x) for x in rpos])
+    model = DecisionTreeRegressor()
+    grid_search = GridSearchCV(
+        model, param_grid, cv=3, scoring="neg_mean_squared_error"
+    )
+    grid_search.fit(X_val, y_val)
 
-    return currentPos  # Return the updated positions   
+    best_model = grid_search.best_estimator_
+    best_model.fit(X, y)
+
+    if nt < 10:
+        return np.zeros(nins)
+
+    # Prepare the feature input for prediction
+    last_window = prcSoFar[:, -10:].flatten().reshape(1, -1)
+    pred_ret = best_model.predict(last_window).flatten()
+
+    lNorm = np.sqrt(pred_ret.dot(pred_ret))
+    pred_ret /= lNorm
+    rpos = np.array([int(x) for x in 20000 * pred_ret / prcSoFar[:, -1]])
+
+    # Adjust positions based on fluctuation criteria
+    for i in range(nins):
+        if isFluctuating(prcSoFar[i], window=10) and hasOverallLoss(
+            prcSoFar[i], window=10
+        ):
+            rpos[i] = 0
+
+    currentPos = np.array([int(x) for x in currentPos + rpos])
+
+    return currentPos
